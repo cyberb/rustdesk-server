@@ -71,6 +71,111 @@ pub async fn accept_or_pending(
     }
 }
 
+pub fn ws_only() -> bool {
+    let value = get_arg("ws-only").to_uppercase();
+    value == "Y" || value == "TRUE" || value == "1"
+}
+
+pub async fn listen_tcp_unless_ws_only(
+    bind_addr: Option<IpAddr>,
+    port: u16,
+) -> ResultType<Option<hbb_common::tokio::net::TcpListener>> {
+    if ws_only() {
+        Ok(None)
+    } else {
+        Ok(Some(listen_tcp(bind_addr, port).await?))
+    }
+}
+
+pub enum WsListener {
+    Tcp(hbb_common::tokio::net::TcpListener),
+    #[cfg(unix)]
+    Unix(hbb_common::tokio::net::UnixListener),
+}
+
+pub enum WsConnection {
+    Tcp(hbb_common::tokio::net::TcpStream, SocketAddr),
+    #[cfg(unix)]
+    Unix(hbb_common::tokio::net::UnixStream, SocketAddr),
+}
+
+impl WsListener {
+    pub async fn accept(&self) -> std::io::Result<WsConnection> {
+        match self {
+            WsListener::Tcp(listener) => {
+                let (stream, addr) = listener.accept().await?;
+                stream.set_nodelay(true).ok();
+                Ok(WsConnection::Tcp(stream, addr))
+            }
+            #[cfg(unix)]
+            WsListener::Unix(listener) => {
+                let (stream, _) = listener.accept().await?;
+                Ok(WsConnection::Unix(stream, next_ws_addr(None)))
+            }
+        }
+    }
+}
+
+pub async fn listen_ws(bind_addr: Option<IpAddr>, port: u16) -> ResultType<WsListener> {
+    let path = get_arg("ws-socket");
+    if path.is_empty() {
+        if ws_only() {
+            hbb_common::bail!("ws-only requires ws-socket");
+        }
+        let listener = listen_tcp(bind_addr, port).await?;
+        log::info!("Listening on websocket {}", listener.local_addr()?);
+        return Ok(WsListener::Tcp(listener));
+    }
+    listen_ws_unix(&path)
+}
+
+#[cfg(unix)]
+fn listen_ws_unix(path: &str) -> ResultType<WsListener> {
+    use std::os::unix::fs::FileTypeExt;
+    if let Ok(metadata) = fs::symlink_metadata(path) {
+        if !metadata.file_type().is_socket() {
+            hbb_common::bail!("{} exists and is not a socket", path);
+        }
+        fs::remove_file(path)?;
+    }
+    let listener = hbb_common::tokio::net::UnixListener::bind(path)?;
+    log::info!("Listening on websocket unix:{}", path);
+    Ok(WsListener::Unix(listener))
+}
+
+#[cfg(not(unix))]
+fn listen_ws_unix(_path: &str) -> ResultType<WsListener> {
+    hbb_common::bail!("ws-socket is only supported on unix");
+}
+
+static WS_ADDR_PORT: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(0);
+
+pub fn next_ws_addr(ip: Option<IpAddr>) -> SocketAddr {
+    let mut port = 0;
+    while port == 0 {
+        port = WS_ADDR_PORT
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            .wrapping_add(1);
+    }
+    SocketAddr::new(ip.unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED)), port)
+}
+
+pub fn ws_peer_addr(
+    headers: &tungstenite::http::HeaderMap,
+    addr: SocketAddr,
+) -> SocketAddr {
+    let real_ip = headers
+        .get("X-Real-IP")
+        .or_else(|| headers.get("X-Forwarded-For"))
+        .and_then(|header_value| header_value.to_str().ok())
+        .and_then(|value| value.split(',').next())
+        .and_then(|value| value.trim().parse::<IpAddr>().ok());
+    match real_ip {
+        Some(ip) => next_ws_addr(Some(ip)),
+        None => addr,
+    }
+}
+
 #[allow(dead_code)]
 pub(crate) fn get_expired_time() -> Instant {
     let now = Instant::now();
@@ -456,6 +561,62 @@ async fn check_software_update_() -> hbb_common::ResultType<()> {
 mod tests {
     use super::*;
     use std::net::{Ipv4Addr, Ipv6Addr};
+
+    fn ws_headers(name: &'static str, value: &'static str) -> tungstenite::http::HeaderMap {
+        let mut headers = tungstenite::http::HeaderMap::new();
+        headers.insert(name, tungstenite::http::HeaderValue::from_static(value));
+        headers
+    }
+
+    #[test]
+    fn ws_peer_addr_without_proxy_headers_is_the_socket_address() {
+        let addr: SocketAddr = "10.0.0.1:1234".parse().unwrap();
+        assert_eq!(
+            ws_peer_addr(&tungstenite::http::HeaderMap::new(), addr),
+            addr
+        );
+    }
+
+    #[test]
+    fn ws_peer_addr_keeps_proxied_connections_from_one_ip_apart() {
+        let addr: SocketAddr = "127.0.0.1:1234".parse().unwrap();
+        let headers = ws_headers("X-Real-IP", "203.0.113.7");
+        let first = ws_peer_addr(&headers, addr);
+        let second = ws_peer_addr(&headers, addr);
+        assert_eq!(first.ip(), "203.0.113.7".parse::<IpAddr>().unwrap());
+        assert_eq!(second.ip(), first.ip());
+        assert_ne!(first.port(), 0);
+        assert_ne!(second.port(), 0);
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn ws_peer_addr_takes_the_client_from_a_forwarded_chain() {
+        let addr: SocketAddr = "127.0.0.1:1234".parse().unwrap();
+        let headers = ws_headers("X-Forwarded-For", "2001:db8::1, 10.0.0.2");
+        assert_eq!(
+            ws_peer_addr(&headers, addr).ip(),
+            "2001:db8::1".parse::<IpAddr>().unwrap()
+        );
+    }
+
+    #[cfg(unix)]
+    #[hbb_common::tokio::test]
+    async fn ws_unix_listener_replaces_a_stale_socket_but_not_a_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("ws.sock");
+        let socket = socket.to_str().unwrap();
+        drop(listen_ws_unix(socket).unwrap());
+        assert!(matches!(
+            listen_ws_unix(socket).unwrap(),
+            WsListener::Unix(_)
+        ));
+
+        let file = dir.path().join("file");
+        fs::write(&file, "data").unwrap();
+        assert!(listen_ws_unix(file.to_str().unwrap()).is_err());
+        assert_eq!(fs::read_to_string(&file).unwrap(), "data");
+    }
 
     #[test]
     fn argument_names_ignore_case_and_separator() {

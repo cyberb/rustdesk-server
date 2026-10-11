@@ -12,7 +12,7 @@ use hbb_common::{
     timeout,
     tokio::{
         self,
-        io::{AsyncReadExt, AsyncWriteExt},
+        io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
         net::{TcpListener, TcpStream},
         sync::{Mutex, RwLock},
         time::{interval, Duration},
@@ -83,16 +83,23 @@ pub async fn start_with_bind(
         BLOCKLIST.read().await.len()
     );
     let port: u16 = port.parse()?;
-    log::info!("Listening on tcp :{}", port);
     let port2 = port + 2;
-    log::info!("Listening on websocket :{}", port2);
+    let ws_only = crate::common::ws_only();
     let main_task = async move {
         loop {
             log::info!("Start");
+            let listener = crate::common::listen_tcp_unless_ws_only(bind_addr, port).await?;
+            if let Some(listener) = listener.as_ref() {
+                log::info!("Listening on tcp {}", listener.local_addr()?);
+            }
             io_loop(
-                crate::common::listen_tcp(bind_addr, port).await?,
-                crate::common::listen_tcp(bind_addr, port2).await?,
-                crate::common::listen_console(bind_addr, port).await?,
+                listener,
+                crate::common::listen_ws(bind_addr, port2).await?,
+                if ws_only {
+                    None
+                } else {
+                    crate::common::listen_console(bind_addr, port).await?
+                },
                 &key,
             )
             .await;
@@ -334,8 +341,8 @@ async fn check_cmd(cmd: &str, limiter: Limiter) -> String {
 }
 
 async fn io_loop(
-    listener: TcpListener,
-    listener2: TcpListener,
+    listener: Option<TcpListener>,
+    listener2: crate::common::WsListener,
     listener_console: Option<TcpListener>,
     key: &str,
 ) {
@@ -343,11 +350,11 @@ async fn io_loop(
     let limiter = <Limiter>::new(TOTAL_BANDWIDTH.load(Ordering::SeqCst) as _);
     loop {
         tokio::select! {
-            res = listener.accept() => {
+            res = crate::common::accept_or_pending(listener.as_ref()) => {
                 match res {
                     Ok((stream, addr))  => {
                         stream.set_nodelay(true).ok();
-                        handle_connection(stream, addr, &limiter, key, false).await;
+                        handle_connection(stream, addr, &limiter, key).await;
                     }
                     Err(err) => {
                        log::error!("listener.accept failed: {}", err);
@@ -357,9 +364,12 @@ async fn io_loop(
             }
             res = listener2.accept() => {
                 match res {
-                    Ok((stream, addr))  => {
-                        stream.set_nodelay(true).ok();
-                        handle_connection(stream, addr, &limiter, key, true).await;
+                    Ok(crate::common::WsConnection::Tcp(stream, addr)) => {
+                        handle_ws_connection(stream, addr, &limiter, key).await;
+                    }
+                    #[cfg(unix)]
+                    Ok(crate::common::WsConnection::Unix(stream, addr)) => {
+                        handle_ws_connection(stream, addr, &limiter, key).await;
                     }
                     Err(err) => {
                        log::error!("listener2.accept failed: {}", err);
@@ -371,7 +381,7 @@ async fn io_loop(
                 match res {
                     Ok((stream, addr))  => {
                         stream.set_nodelay(true).ok();
-                        handle_connection(stream, addr, &limiter, key, false).await;
+                        handle_connection(stream, addr, &limiter, key).await;
                     }
                     Err(err) => {
                        log::error!("console listener.accept failed: {}", err);
@@ -383,15 +393,9 @@ async fn io_loop(
     }
 }
 
-async fn handle_connection(
-    stream: TcpStream,
-    addr: SocketAddr,
-    limiter: &Limiter,
-    key: &str,
-    ws: bool,
-) {
+async fn handle_connection(stream: TcpStream, addr: SocketAddr, limiter: &Limiter, key: &str) {
     let ip = hbb_common::try_into_v4(addr).ip();
-    if !ws && ip.is_loopback() {
+    if ip.is_loopback() {
         let limiter = limiter.clone();
         tokio::spawn(async move {
             let mut stream = stream;
@@ -405,56 +409,64 @@ async fn handle_connection(
         });
         return;
     }
-    let ip = ip.to_string();
-    if BLOCKLIST.read().await.get(&ip).is_some() {
-        log::info!("{} blocked", ip);
+    if is_blocked(addr).await {
         return;
     }
     let key = key.to_owned();
     let limiter = limiter.clone();
     tokio::spawn(async move {
-        allow_err!(make_pair(stream, addr, &key, limiter, ws).await);
+        make_pair_(FramedStream::from(stream, addr), addr, &key, limiter).await;
     });
 }
 
-async fn make_pair(
-    stream: TcpStream,
+async fn handle_ws_connection<S>(stream: S, addr: SocketAddr, limiter: &Limiter, key: &str)
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + Sync + 'static,
+{
+    let key = key.to_owned();
+    let limiter = limiter.clone();
+    tokio::spawn(async move {
+        allow_err!(make_pair_ws(stream, addr, &key, limiter).await);
+    });
+}
+
+async fn is_blocked(addr: SocketAddr) -> bool {
+    let ip = hbb_common::try_into_v4(addr).ip().to_string();
+    if BLOCKLIST.read().await.get(&ip).is_some() {
+        log::info!("{} blocked", ip);
+        return true;
+    }
+    false
+}
+
+async fn make_pair_ws<S>(
+    stream: S,
     mut addr: SocketAddr,
     key: &str,
     limiter: Limiter,
-    ws: bool,
-) -> ResultType<()> {
-    if ws {
-        use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
-        let callback = |req: &Request, response: Response| {
-            let headers = req.headers();
-            // X-Real-IP / X-Forwarded-For are trusted as-is so that the real
-            // client IP is preserved when the WebSocket port runs behind a
-            // reverse proxy (WSS). They are NOT validated: anyone who can reach
-            // this port directly can spoof an arbitrary IP, bypassing IP-based
-            // rate limiting / blocking and corrupting logged IPs. Do not expose
-            // the WebSocket port directly to untrusted networks; only the
-            // reverse proxy, which overwrites these headers, should be able to
-            // connect to it.
-            // https://github.com/rustdesk/rustdesk-server/issues/634
-            let real_ip = headers
-                .get("X-Real-IP")
-                .or_else(|| headers.get("X-Forwarded-For"))
-                .and_then(|header_value| header_value.to_str().ok());
-            if let Some(ip) = real_ip {
-                if ip.contains('.') {
-                    addr = format!("{ip}:0").parse().unwrap_or(addr);
-                } else {
-                    addr = format!("[{ip}]:0").parse().unwrap_or(addr);
-                }
-            }
-            Ok(response)
-        };
-        let ws_stream = tokio_tungstenite::accept_hdr_async(stream, callback).await?;
-        make_pair_(ws_stream, addr, key, limiter).await;
-    } else {
-        make_pair_(FramedStream::from(stream, addr), addr, key, limiter).await;
+) -> ResultType<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + Sync + 'static,
+{
+    use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
+    let callback = |req: &Request, response: Response| {
+        // X-Real-IP / X-Forwarded-For are trusted as-is so that the real
+        // client IP is preserved when the WebSocket port runs behind a
+        // reverse proxy (WSS). They are NOT validated: anyone who can reach
+        // this port directly can spoof an arbitrary IP, bypassing IP-based
+        // rate limiting / blocking and corrupting logged IPs. Do not expose
+        // the WebSocket port directly to untrusted networks; only the
+        // reverse proxy, which overwrites these headers, should be able to
+        // connect to it.
+        // https://github.com/rustdesk/rustdesk-server/issues/634
+        addr = crate::common::ws_peer_addr(req.headers(), addr);
+        Ok(response)
+    };
+    let ws_stream = tokio_tungstenite::accept_hdr_async(stream, callback).await?;
+    if is_blocked(addr).await {
+        return Ok(());
     }
+    make_pair_(ws_stream, addr, key, limiter).await;
     Ok(())
 }
 
@@ -468,8 +480,10 @@ async fn make_pair_(stream: impl StreamTrait, addr: SocketAddr, key: &str, limit
                     return;
                 }
                 if !rf.uuid.is_empty() {
-                    let mut peer = PEERS.lock().await.remove(&rf.uuid);
+                    let mut peers = PEERS.lock().await;
+                    let mut peer = peers.remove(&rf.uuid);
                     if let Some(peer) = peer.as_mut() {
+                        drop(peers);
                         log::info!("Relayrequest {} from {} got paired", rf.uuid, addr);
                         let id = format!("{}:{}", addr.ip(), addr.port());
                         USAGE.write().await.insert(id.clone(), Default::default());
@@ -487,7 +501,8 @@ async fn make_pair_(stream: impl StreamTrait, addr: SocketAddr, key: &str, limit
                         USAGE.write().await.remove(&id);
                     } else {
                         log::info!("New relay request {} from {}", rf.uuid, addr);
-                        PEERS.lock().await.insert(rf.uuid.clone(), Box::new(stream));
+                        peers.insert(rf.uuid.clone(), Box::new(stream));
+                        drop(peers);
                         sleep(30.).await;
                         PEERS.lock().await.remove(&rf.uuid);
                     }
@@ -650,7 +665,10 @@ impl StreamTrait for FramedStream {
 }
 
 #[async_trait]
-impl StreamTrait for tokio_tungstenite::WebSocketStream<TcpStream> {
+impl<S> StreamTrait for tokio_tungstenite::WebSocketStream<S>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + Sync + 'static,
+{
     async fn recv(&mut self) -> Option<Result<BytesMut, Error>> {
         if let Some(msg) = self.next().await {
             match msg {
